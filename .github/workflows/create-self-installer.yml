@@ -1,0 +1,103 @@
+name: Create Self-Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - devel
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+permissions: {} # none
+
+jobs:
+  build:
+    name: build self-installer
+    # No repository_owner guard, so this also runs on forks. Skip draft PRs only.
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    permissions:
+      contents: read # upload-artifact does not need contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history + tags so `git describe` yields a real version
+
+      - name: Install build prerequisites
+        run: ./ci_prereq.sh
+
+      - name: Build and install dosemu2 + fdpp
+        env:
+          BLDTYPE: ""
+          RUNTYPE: ""
+          OS: ubuntu-24.04
+        run: ./ci_build_or_install.sh
+
+      - name: Build and install comcom32 (COMMAND.COM)
+        # comcom32 is not packaged; build it from source with DJGPP. It is
+        # self-contained (no dj64/djdev64), which is why we prefer it here.
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y ppa:jwt27/djgpp-toolchain
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-djgpp djgpp-dev
+          git clone --depth 1 https://github.com/dosemu2/comcom64.git comcom32.git
+          make -C comcom32.git 32
+          # 32/makefile install -> $(prefix)/share/comcom32 (+ command.com symlink)
+          sudo make -C comcom32.git/32 install || {
+            echo "install target failed; staging comcom32.exe manually"
+            exe="$(find comcom32.git -name comcom32.exe | head -n1)"
+            test -n "$exe"
+            sudo mkdir -p /usr/local/share/comcom32
+            sudo cp "$exe" /usr/local/share/comcom32/
+            sudo ln -sf comcom32.exe /usr/local/share/comcom32/command.com
+          }
+          ls -l /usr/local/share/comcom32
+
+      - name: Show install layout (debug)
+        run: |
+          echo "dosemu on PATH: $(command -v dosemu || echo none)"
+          for p in /usr/local /usr; do
+            echo "===== $p ====="
+            for s in libexec/dosemu2 lib/dosemu share/dosemu share/comcom32 share/comcom64 lib/fdpp share/fdpp; do
+              echo "--- $p/$s"; ls -la "$p/$s" 2>/dev/null || echo "   (absent)"
+            done
+            ls -la "$p"/lib/libdosemu2.so* 2>/dev/null || true
+          done
+          echo "===== dosemu2.bin locations ====="
+          find /usr /usr/local -name dosemu2.bin 2>/dev/null || true
+
+      - name: Generate the self-installer
+        run: |
+          mkdir -p dist
+          # no --prefix: the generator locates dosemu2.bin itself
+          ( cd dist && "${GITHUB_WORKSPACE}/scripts/make-self-installer.sh" )
+          ls -lh dist/
+
+      - name: Smoke-test the installer (verify, install, boot DOS, uninstall)
+        run: |
+          set -euo pipefail
+          inst="$(ls dist/dosemu2-*-installer.sh)"
+          echo "Testing $inst"
+          "$inst" --check
+          "$inst" --install-dir "${RUNNER_TEMP}/dm2test"
+          # No KVM on the runner: dosemu2 falls back to its JIT (cpuemu), which is fine.
+          out="$("${RUNNER_TEMP}/dm2test/bin/dosemu" -td -E "ver" 2>/dev/null || true)"
+          echo "----- DOS output -----"; echo "$out"; echo "----------------------"
+          echo "$out" | grep -qi "dosemu2" || { echo "::error::installer smoke test failed (DOS did not boot)"; exit 1; }
+          "$inst" --uninstall --install-dir "${RUNNER_TEMP}/dm2test"
+          test ! -e "${RUNNER_TEMP}/dm2test" || { echo "::error::uninstall left files behind"; exit 1; }
+          echo "Smoke test passed."
+
+      - name: Upload self-installer artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: dosemu2-self-installer-${{ github.sha }}
+          path: dist/dosemu2-*-installer.sh
+          if-no-files-found: error
