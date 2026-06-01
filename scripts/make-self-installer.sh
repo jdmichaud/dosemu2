@@ -64,22 +64,6 @@ for t in tar xz awk sed find sha256sum readlink; do
   command -v "$t" >/dev/null 2>&1 || die "required tool '$t' not found"
 done
 
-# --- locate the install prefix ---------------------------------------------
-if [ -z "$PREFIX" ]; then
-  if command -v dosemu >/dev/null 2>&1; then
-    # <prefix>/bin/dosemu -> <prefix>
-    PREFIX="$(cd "$(dirname "$(readlink -f "$(command -v dosemu)")")/.." && pwd)"
-  elif [ -d /usr/local/libexec/dosemu2 ]; then
-    PREFIX=/usr/local
-  elif [ -d /usr/libexec/dosemu2 ]; then
-    PREFIX=/usr
-  else
-    die "cannot auto-detect a dosemu2 prefix; pass --prefix DIR"
-  fi
-fi
-[ -d "$PREFIX" ] || die "prefix does not exist: $PREFIX"
-log "Using dosemu2 prefix: $PREFIX"
-
 # find_in <relpath> <search-prefixes...> -> echoes first existing <p>/<relpath>
 find_in() {
   local rel="$1"; shift
@@ -90,15 +74,45 @@ find_in() {
   return 1
 }
 
+# --- locate the dosemu2 prefix by finding the emulator itself --------------
+# Don't trust a single hardcoded prefix: the install may live under /usr or
+# /usr/local, so search and derive the prefix from where dosemu2.bin actually
+# is.  An explicit --prefix is just tried first.
+CAND_PREFIXES=()
+[ -n "$PREFIX" ] && CAND_PREFIXES+=("$PREFIX")
+if command -v dosemu >/dev/null 2>&1; then
+  CAND_PREFIXES+=("$(cd "$(dirname "$(readlink -f "$(command -v dosemu)")")/.." && pwd)")
+fi
+CAND_PREFIXES+=(/usr/local /usr)
+
+PREFIX=""
+for p in "${CAND_PREFIXES[@]}"; do
+  if [ -f "$p/libexec/dosemu2/dosemu2.bin" ]; then PREFIX="$p"; break; fi
+done
+[ -n "$PREFIX" ] \
+  || die "dosemu2 emulator (libexec/dosemu2/dosemu2.bin) not found in: ${CAND_PREFIXES[*]}"
+log "Using dosemu2 prefix: $PREFIX"
+
 SEARCH_PREFIXES=("$PREFIX" /usr/local /usr)
+# library dirs vary: lib, lib64, or multiarch (lib/<triplet>)
+LIBDIRS=("$PREFIX/lib" "$PREFIX/lib64" "$PREFIX"/lib/*-linux-gnu)
 
 # --- required dosemu2 components -------------------------------------------
 DOSEMU_BIN="$PREFIX/libexec/dosemu2/dosemu2.bin"
-[ -f "$DOSEMU_BIN" ] || die "emulator not found: $DOSEMU_BIN"
-[ -d "$PREFIX/lib/dosemu" ] || die "plugin dir not found: $PREFIX/lib/dosemu"
 [ -d "$PREFIX/share/dosemu" ] || die "data dir not found: $PREFIX/share/dosemu"
-LIBDOSEMU="$(find "$PREFIX/lib" -maxdepth 1 -name 'libdosemu2.so.*' -type f | head -n1)"
-[ -n "$LIBDOSEMU" ] || die "libdosemu2 not found under $PREFIX/lib"
+
+PLUGINDIR=""
+for d in "${LIBDIRS[@]}"; do [ -d "$d/dosemu" ] && { PLUGINDIR="$d/dosemu"; break; }; done
+[ -n "$PLUGINDIR" ] \
+  || die "plugin dir (lib/dosemu) not found under $PREFIX (looked in: ${LIBDIRS[*]})"
+
+LIBDOSEMU=""
+for d in "${LIBDIRS[@]}"; do
+  f="$(find "$d" -maxdepth 1 -name 'libdosemu2.so.*' -type f 2>/dev/null | head -n1)"
+  [ -n "$f" ] && { LIBDOSEMU="$f"; break; }
+done
+[ -n "$LIBDOSEMU" ] \
+  || die "libdosemu2 not found under $PREFIX (looked in: ${LIBDIRS[*]})"
 
 [ -n "$LAUNCHER" ] || LAUNCHER="$PREFIX/bin/dosemu"
 [ -f "$LAUNCHER" ] || die "launcher not found: $LAUNCHER (pass --launcher)"
@@ -133,6 +147,9 @@ fi
 [ -n "$OUTPUT" ] || OUTPUT="$PWD/dosemu2-${VERSION}-installer.sh"
 
 log "Version:   $VERSION"
+log "emulator:  $DOSEMU_BIN"
+log "plugins:   $PLUGINDIR"
+log "libdosemu: $LIBDOSEMU"
 log "fdpp:      $FDPP_LIB_DIR + $FDPP_SHARE_DIR"
 log "comcom:    $COMCOM_DIR"
 log "launcher:  $LAUNCHER"
@@ -152,7 +169,7 @@ mkdir -p "$STAGE/bin" "$STAGE/lib/dosemu" "$STAGE/libexec" \
 
 log "Staging runtime files"
 cp -a "$PREFIX/libexec/dosemu2"        "$STAGE/libexec/"
-cp -a "$PREFIX/lib/dosemu/."           "$STAGE/lib/dosemu/"
+cp -a "$PLUGINDIR/."                   "$STAGE/lib/dosemu/"
 cp -a "$LIBDOSEMU"                     "$STAGE/lib/"
 # recreate the unversioned libdosemu2.so symlink (relative)
 ( cd "$STAGE/lib" && ln -sf "$(basename "$LIBDOSEMU")" libdosemu2.so )

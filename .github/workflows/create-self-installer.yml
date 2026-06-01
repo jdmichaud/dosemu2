@@ -59,10 +59,24 @@ jobs:
           }
           ls -l /usr/local/share/comcom32
 
+      - name: Show install layout (debug)
+        run: |
+          echo "dosemu on PATH: $(command -v dosemu || echo none)"
+          for p in /usr/local /usr; do
+            echo "===== $p ====="
+            for s in libexec/dosemu2 lib/dosemu share/dosemu share/comcom32 share/comcom64 lib/fdpp share/fdpp; do
+              echo "--- $p/$s"; ls -la "$p/$s" 2>/dev/null || echo "   (absent)"
+            done
+            ls -la "$p"/lib/libdosemu2.so* 2>/dev/null || true
+          done
+          echo "===== dosemu2.bin locations ====="
+          find /usr /usr/local -name dosemu2.bin 2>/dev/null || true
+
       - name: Generate the self-installer
         run: |
           mkdir -p dist
-          ( cd dist && "${GITHUB_WORKSPACE}/scripts/make-self-installer.sh" --prefix /usr/local )
+          # no --prefix: the generator locates dosemu2.bin itself
+          ( cd dist && "${GITHUB_WORKSPACE}/scripts/make-self-installer.sh" )
           ls -lh dist/
 
       - name: Smoke-test the installer (verify, install, boot DOS, uninstall)
