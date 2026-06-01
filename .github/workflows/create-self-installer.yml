@@ -6,6 +6,8 @@ on:
     branches:
       - master
       - devel
+    tags:
+      - 'dosemu2-*' # release tags (e.g. dosemu2-2.0pre9) -> attach installer to the release
   pull_request:
     types:
       - opened
@@ -20,7 +22,7 @@ jobs:
     # No repository_owner guard, so this also runs on forks. Skip draft PRs only.
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     permissions:
-      contents: read # upload-artifact does not need contents: write
+      contents: write # needed to create/update the GitHub Release on tag pushes
     runs-on: ubuntu-24.04
     steps:
       - name: Clone repository
@@ -101,3 +103,15 @@ jobs:
           name: dosemu2-self-installer-${{ github.sha }}
           path: dist/dosemu2-*-installer.sh
           if-no-files-found: error
+
+      # On a release tag (dosemu2-*), publish the installer as a durable,
+      # anonymously-downloadable GitHub Release asset (the run artifact above
+      # is zip-wrapped and expires; release assets do not).
+      - name: Attach installer to the GitHub Release
+        if: ${{ success() && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/dosemu2-*-installer.sh
+          fail_on_unmatched_files: true
+          # mark preview/dev tags (e.g. 2.0pre9, *-dev) as pre-releases
+          prerelease: ${{ contains(github.ref_name, 'pre') || contains(github.ref_name, 'dev') }}
