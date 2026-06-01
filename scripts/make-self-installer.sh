@@ -118,10 +118,21 @@ done
 [ -f "$LAUNCHER" ] || die "launcher not found: $LAUNCHER (pass --launcher)"
 
 # --- fdpp (DOS kernel) ------------------------------------------------------
-FDPP_LIB_DIR="$(find_in lib/fdpp "${SEARCH_PREFIXES[@]}")" \
-  || die "fdpp libraries (lib/fdpp) not found in: ${SEARCH_PREFIXES[*]}"
-FDPP_SHARE_DIR="$(find_in share/fdpp "${SEARCH_PREFIXES[@]}")" \
-  || die "fdpp kernel (share/fdpp) not found in: ${SEARCH_PREFIXES[*]}"
+# fdpp libs may be in lib/fdpp, lib64/fdpp or lib/<triplet>/fdpp -- locate the
+# actual libfdpp.so and use its directory.  The kernel ELF is under share/fdpp.
+FDPP_LIBROOTS=()
+for pfx in "$PREFIX" /usr/local /usr; do
+  for d in "$pfx/lib" "$pfx/lib64"; do [ -d "$d" ] && FDPP_LIBROOTS+=("$d"); done
+done
+fdpp_lib="$(find "${FDPP_LIBROOTS[@]}" -name 'libfdpp.so*' -type f 2>/dev/null | head -n1 || true)"
+[ -n "$fdpp_lib" ] || die "fdpp library (libfdpp.so) not found under: ${FDPP_LIBROOTS[*]}"
+FDPP_LIB_DIR="$(dirname "$fdpp_lib")"
+
+FDPP_SHAREROOTS=()
+for pfx in "$PREFIX" /usr/local /usr; do [ -d "$pfx/share" ] && FDPP_SHAREROOTS+=("$pfx/share"); done
+fdpp_krnl="$(find "${FDPP_SHAREROOTS[@]}" -name 'fdppkrnl*.elf' 2>/dev/null | head -n1 || true)"
+[ -n "$fdpp_krnl" ] || die "fdpp kernel (fdppkrnl*.elf) not found under: ${FDPP_SHAREROOTS[*]}"
+FDPP_SHARE_DIR="$(dirname "$fdpp_krnl")"
 
 # --- comcom (COMMAND.COM provider) -----------------------------------------
 # Prefer comcom32: self-contained (no dj64/djdev64), boots under cpuemu on any
@@ -164,7 +175,7 @@ STAGE="$TMP/stage"
 # whether the directory name contains "32" (comcom_hook in config.c), so it
 # must stay comcom32/comcom64 -- not a generic name.
 CC_NAME="$(basename "$COMCOM_DIR")"
-mkdir -p "$STAGE/bin" "$STAGE/lib/dosemu" "$STAGE/libexec" \
+mkdir -p "$STAGE/bin" "$STAGE/lib/dosemu" "$STAGE/lib/fdpp" "$STAGE/libexec" \
          "$STAGE/share/dosemu" "$STAGE/share/fdpp" "$STAGE/share/$CC_NAME"
 
 log "Staging runtime files"
@@ -173,7 +184,7 @@ cp -a "$PLUGINDIR/."                   "$STAGE/lib/dosemu/"
 cp -a "$LIBDOSEMU"                     "$STAGE/lib/"
 # recreate the unversioned libdosemu2.so symlink (relative)
 ( cd "$STAGE/lib" && ln -sf "$(basename "$LIBDOSEMU")" libdosemu2.so )
-cp -a "$FDPP_LIB_DIR"                  "$STAGE/lib/"          # -> lib/fdpp
+cp -a "$FDPP_LIB_DIR/."                "$STAGE/lib/fdpp/"     # normalize -> lib/fdpp
 cp -a "$FDPP_SHARE_DIR/."              "$STAGE/share/fdpp/"
 cp -a "$PREFIX/share/dosemu/."         "$STAGE/share/dosemu/"
 cp -a "$COMCOM_DIR/."                  "$STAGE/share/$CC_NAME/"
