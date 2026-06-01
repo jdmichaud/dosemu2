@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - master
       - devel
-      - feature/self-installer # TEMPORARY: test on the fork branch; remove for main-only
   pull_request:
     types:
       - opened
