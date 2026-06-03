@@ -33,12 +33,34 @@ jobs:
       - name: Install build prerequisites
         run: ./ci_prereq.sh
 
-      - name: Build and install dosemu2 + fdpp
-        env:
-          BLDTYPE: ""
-          RUNTYPE: ""
-          OS: ubuntu-24.04
-        run: ./ci_build_or_install.sh
+      # Release builds (no -d / no fdpp debug flags) so the installer ships
+      # small, optimized binaries -- not the debug build ci_build_or_install.sh
+      # produces (used by the test suite). Dependency setup mirrors that script.
+      - name: Build and install fdpp (release)
+        run: |
+          set -eux
+          git clone --depth 1 --no-single-branch https://github.com/dosemu2/fdpp.git localfdpp.git
+          cd localfdpp.git
+          git config user.email "ci@github"
+          git config user.name "CI build"
+          git tag tmp -m "make git-describe happy"
+          # release: do NOT write a debug local.mak (no DEBUG_MODE/EXTRA_DEBUG/USE_UBSAN)
+          sudo add-apt-repository -y ppa:stsp-0/nasm-segelf
+          sudo add-apt-repository -y ppa:stsp-0/thunk-gen
+          sudo apt-get update -q
+          mk-build-deps --install --root-cmd sudo
+          make
+          sudo make install
+
+      - name: Build and install dosemu2 (release)
+        run: |
+          set -eux
+          sudo add-apt-repository -y -c main -c main/debug ppa:dosemu2/ppa
+          mk-build-deps --install --root-cmd sudo
+          sudo apt-get remove -y fdpp || true   # prefer our locally-built fdpp
+          ./default-configure                   # release (no -d -> compiletime-settings)
+          make
+          sudo make install
 
       - name: Build and install comcom32 (COMMAND.COM)
         # comcom32 is not packaged; build it from source with DJGPP. It is
