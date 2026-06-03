@@ -7,6 +7,7 @@
 #ifndef DOS2LINUX_H
 #define DOS2LINUX_H
 
+#include <sys/stat.h>
 #include "cpu.h"
 #include "dosemu_debug.h"
 
@@ -346,7 +347,9 @@ void memcpy_2unix(void *dest, dosaddr_t src, size_t n);
 void memcpy_2dos(dosaddr_t dest, const void *src, size_t n);
 void memmove_dos2dos(dosaddr_t dest, dosaddr_t src, size_t n);
 void memcpy_dos2dos(dosaddr_t dest, dosaddr_t src, size_t n);
-void memset_dos(dosaddr_t dest, char ch, size_t n);
+void memset_dos(dosaddr_t dest, unsigned char ch, size_t n);
+void memsetw_dos(dosaddr_t dest, unsigned short ch, size_t n);
+void memsetl_dos(dosaddr_t dest, unsigned int ch, size_t n);
 
 int unix_read(int fd, void *data, int cnt);
 int dos_read(int fd, unsigned data, int cnt);
@@ -395,6 +398,8 @@ char *strnlowerDOS(char *s, int n);
 int strequalDOS(const char *s1, const char *s2);
 char *strstrDOS(char *haystack, const char *upneedle);
 int name_ufs_to_dos(char *dest, const char *src);
+char *probe_sfn_name(int dir_fd, const char *dir, const char *name,
+    struct stat *r_st);
 
 void dos2tty_init(void);
 void dos2tty_done(void);

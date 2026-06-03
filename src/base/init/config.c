@@ -32,6 +32,7 @@
 #include "dosemu_config.h"
 #include "init.h"
 #include "disks.h"
+#include "fatfs.h"
 #include "pktdrvr.h"
 #include "speaker.h"
 #include "sound/sound.h"
@@ -259,6 +260,7 @@ void dump_config_status(void (*printfunc)(const char *, ...))
       case SPKR_OFF: s = "off"; break;
       case SPKR_NATIVE: s = "native"; break;
       case SPKR_EMULATED: s = "emulated"; break;
+      case SPKR_SOUND: s = "sound"; break;
       default: s = "wrong"; break;
     }
     (*print)("dualmon %d\nforce_vt_switch %d\nspeaker \"%s\"\n",
@@ -702,6 +704,13 @@ static char *path_expand(char *path)
   return expand_path(buf);
 }
 
+static void set_drv_c(char *path)
+{
+  free(dosemu_drive_c_path);
+  dosemu_drive_c_path = path;
+  config.alt_drv_c = 1;
+}
+
 void secure_option_preparse(int *argc, char **argv)
 {
   char *opt;
@@ -790,9 +799,7 @@ void secure_option_preparse(int *argc, char **argv)
     if (opt && opt[0]) {
       char *opt1 = path_expand(opt);
       if (opt1) {
-        free(dosemu_drive_c_path);
-        dosemu_drive_c_path = opt1;
-        config.alt_drv_c = 1;
+        set_drv_c(opt1);
         cnt++;
       } else {
         error("--Fdrive_c: %s does not exist\n", opt);
@@ -1388,6 +1395,42 @@ config_init(int argc, char **argv)
 	    exit(0);
 	}
     }
+    /* run prog from cmdline */
+    if (optind < argc && strchr(argv[optind], '=') == NULL &&
+	    !(config.dos_cmd || config.unix_path)) {
+	char *p = NULL, *fpath;
+	fpath = expand_path(argv[optind]);
+	if (!fpath) {
+	    error("%s not found\n", argv[optind]);
+	    config.exitearly = 1;
+	} else {
+	    p = strrchr(fpath, '/');
+	    assert(p); // expand_path() should add some slashes
+	    *p = '\0';
+	    set_drv_c(fpath);
+	}
+	if (p) {
+	    p++;
+	    if (*p) {
+		config.dos_cmd = strdup(p);
+		was_exec++;
+	    }
+	}
+	optind++;
+	if (was_exec) {
+	    /* collect args */
+	    while (optind < argc) {
+		if (strchr(argv[optind], '='))
+		    break;
+		g_printf("DOS command given on command line: %s\n", argv[optind]);
+		config.dos_cmd = realloc(config.dos_cmd,
+			strlen(config.dos_cmd) + strlen(argv[optind]) + 2);
+		strcat(config.dos_cmd, " ");
+		strcat(config.dos_cmd, argv[optind]);
+		optind++;
+	    }
+	}
+    }
 
     if (!can_do_root_stuff_enabled)
 	can_do_root_stuff = 0;
@@ -1419,7 +1462,7 @@ config_init(int argc, char **argv)
     free(dosrcname);
 
     if (config.exitearly && !config_check_only)
-	exit(0);
+	exit(config.exitearly);
 
     i_cur = 0;
     GETOPT_RESET();
@@ -1684,43 +1727,9 @@ config_init(int argc, char **argv)
 
     /* make-style env vars passing */
     while (optind < argc) {
-	char *p, *p1;
-again:
 	if (strchr(argv[optind], '=') == NULL) {
-	    char *fpath;
-	    if (config.dos_cmd || config.unix_path)
-		break;
-	    fpath = expand_path(argv[optind]);
-	    if (!fpath) {
-		error("%s not found\n", argv[optind]);
-		break;
-	    }
-	    p = strrchr(fpath, '/');
-	    assert(p); // expand_path() should add some slashes
-	    config.unix_path = strdup(fpath);
-	    p1 = config.unix_path + (p - fpath);
-	    *p1 = '\0';
-	    p++;
-	    if (!*p) {
-		free(fpath);
-		break;
-	    }
-	    config.dos_cmd = strdup(p);
-	    free(fpath);
-	    was_exec++;
 	    optind++;
-	    /* collect args */
-	    while (argc > optind) {
-		if (strchr(argv[optind], '='))
-			goto again;
-		g_printf("DOS command given on command line: %s\n", argv[optind]);
-		config.dos_cmd = realloc(config.dos_cmd,
-			strlen(config.dos_cmd) + strlen(argv[optind]) + 2);
-		strcat(config.dos_cmd, " ");
-		strcat(config.dos_cmd, argv[optind]);
-		optind++;
-	    }
-	    break;
+	    continue;
 	}
 	g_printf("ENV given on command line: %s\n", argv[optind]);
 	misc_e6_store_options(argv[optind]);
@@ -1916,6 +1925,7 @@ void dp_init(struct disk *dptr)
   dptr->rdonly = 0;
   dptr->header = 0;
   dptr->floppy = 0;
+  dptr->group = -1;
 }
 
 static void assign_floppy(int fnum, const char *name)

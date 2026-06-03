@@ -252,7 +252,7 @@ enum {
 %token KEYTABLE SHIFT_MAP ALT_MAP NUMPAD_MAP DUMP LAYOUT
 %token DGRAVE DACUTE DCIRCUM DTILDE DBREVE DABOVED DDIARES DABOVER DDACUTE DCEDILLA DIOTA DOGONEK DCARON
 	/* ipx */
-%token NETWORK PKTDRIVER TCPDRIVER NE2K
+%token NETWORK PKTDRIVER TCPDRIVER NE2K NE2K_IOBASE NE2K_IRQ
         /* lock files */
 %token DIRECTORY NAMESTUB BINARY
 	/* serial */
@@ -662,6 +662,8 @@ line:		CHARSET '{' charset_flags '}' {}
 			c_printf("CONF: NE2000 %s.\n", 
 				($2) ? "enabled" : "disabled");
 		    }
+		| NE2K_IOBASE int_expr	{ config.ne2k_iobase = $2; }
+		| NE2K_IRQ int_expr	{ config.ne2k_irq = $2; }
 		| ETHDEV string_expr	{ free(config.ethdev); config.ethdev = $2; }
 		| TAPDEV string_expr	{ free(config.tapdev); config.tapdev = $2; }
 		| VDESWITCH string_expr	{ free(config.vdeswitch); config.vdeswitch = $2; }
@@ -676,7 +678,7 @@ line:		CHARSET '{' charset_flags '}' {}
                         c_printf("CONF: allowing speaker port access!\n");
 		      } else {
                         c_printf("CONF: native speaker not allowed: emulate\n");
-			$2 = SPKR_EMULATED;
+			$2 = SPKR_SOUND;
 		      }
 		    }
 		    else
@@ -1868,9 +1870,10 @@ irq_bool:	expression {
 speaker		: L_OFF		{ $$ = SPKR_OFF; }
 		| NATIVE	{ $$ = SPKR_NATIVE; }
 		| EMULATED	{ $$ = SPKR_EMULATED; }
-		| STRING        { yyerror("got '%s', expected 'emulated' or 'native'", $1);
+		| SOUND		{ $$ = SPKR_SOUND; }
+		| STRING        { yyerror("got '%s', expected 'sound', 'emulated' or 'native'", $1);
 				  free($1); }
-		| error         { yyerror("expected 'emulated' or 'native'"); }
+		| error         { yyerror("expected 'sound', 'emulated' or 'native'"); }
 		;
 
 cpu_vm		: L_AUTO	{ $$ = -1; }
@@ -2588,7 +2591,7 @@ static void set_hdimage(struct disk *dptr, char *name)
   c_printf("Set up as an image\n");
 }
 
-static int add_drive(const char *name, int rdonly)
+static int add_drive(const char *name, int rdonly, int group)
 {
   struct disk *dptr = &hdisktab[c_hdisks];
   char *rname = expand_path(name);
@@ -2603,6 +2606,7 @@ static int add_drive(const char *name, int rdonly)
   dptr->drive_num = (c_hdisks | 0x80);
   dptr->log_offs = skipped_disks;
   dptr->mfs_idx = mfs_define_drive(rname);
+  dptr->group = group;
   c_printf("Added drive %i (%x): %s\n", c_hdisks, dptr->drive_num, name);
   c_hdisks++;
   return 0;
@@ -2631,7 +2635,7 @@ static void set_drive_c(void)
     config.alt_drv_c = 0;
   }
   config.drive_c_num = c_hdisks | 0x80;
-  err = add_drive(dosemu_drive_c_path, 0);
+  err = add_drive(dosemu_drive_c_path, 0, 0);
   assert(!err);
 }
 
@@ -2642,14 +2646,14 @@ static void set_dosemu_drive(void)
     config.exitearly = 1;
     return;
   }
-  add_drive(commands_path, 1);
+  add_drive(commands_path, 1, 1);
 }
 
 static void set_default_drives(void)
 {
 #define AD(p) do { \
     if (p) \
-      add_drive(p, 1); \
+      add_drive(p, 1, 2); \
 } while (0)
   c_printf("Setting up default drives from %c\n", 'C' + c_hdisks);
   if (config.try_freedos) {

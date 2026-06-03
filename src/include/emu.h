@@ -241,6 +241,8 @@ typedef struct config_info {
        char   *tcpiface;
        uint32_t tcpgw;
        boolean ne2k;
+       int ne2k_iobase;
+       int ne2k_irq;
        boolean emuretrace;
        boolean mapped_bios;	/* video BIOS */
        char *vbios_file;	/* loaded VBIOS file */
@@ -385,7 +387,7 @@ typedef struct config_info {
 } config_t;
 
 
-enum { SPKR_OFF, SPKR_NATIVE, SPKR_EMULATED };
+enum { SPKR_OFF, SPKR_NATIVE, SPKR_EMULATED, SPKR_SOUND };
 enum { CPUVM_VM86, CPUVM_KVM, CPUVM_EMU, CPUVM_NATIVE };
 
 extern void parent_nextscan(void);

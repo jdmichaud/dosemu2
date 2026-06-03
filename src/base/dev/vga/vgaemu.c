@@ -1016,7 +1016,10 @@ void vga_memsetw(dosaddr_t dst, unsigned short val, size_t len)
       }
       vga_mark_dirty(dststart, offs - dststart);
     } else {
-      MEMSET_DOS(dst, val, len * 2);
+      while (len--) {
+        WRITE_WORD(dst, val);
+        dst += 2;
+      }
     }
     return;
   }
@@ -1038,7 +1041,10 @@ void vga_memsetl(dosaddr_t dst, unsigned val, size_t len)
       }
       vga_mark_dirty(dststart, offs - dststart);
     } else {
-      MEMSET_DOS(dst, val, len * 4);
+      while (len--) {
+        WRITE_DWORD(dst, val);
+        dst += 4;
+      }
     }
     return;
   }
@@ -1488,10 +1494,10 @@ static int vga_emu_map(unsigned mapping, unsigned first_page)
     return 3;
   }
 
-  for(u = 0; u < vmt->pages; u++) {
+  if (vga.mode_class == GRAPH && prot == VGA_EMU_RW_PROT) {
+   for (u = 0; u < vmt->pages; u++)
     /* need to fix up protection for clean pages */
-    if(vga.mode_class == GRAPH && !vga.mem.dirty_map[vmt->first_page + u] &&
-	    prot == VGA_EMU_RW_PROT)
+    if (!vga.mem.dirty_map[vmt->first_page + u])
       _vga_emu_adjust_protection(vmt->first_page + u, (int[]){VGA_PROT_RO, VGA_PROT_RO}, 0, 0);
   }
   pthread_mutex_unlock(&prot_mtx);
@@ -2769,7 +2775,6 @@ static void vgaemu_adjust_instremu(int value)
 {
   int i;
   int changed = (vga.inst_emu != value);
-  vga_mapping_type *vmt = &vga.mem.map[VGAEMU_MAP_BANK_MODE];
 
   if (!changed)
     return;
@@ -2806,9 +2811,9 @@ static void vgaemu_adjust_instremu(int value)
 	vga_emu_protect_page((vga.mem.graph_base >> PAGE_SHIFT) + i, RW, 1);
     }
   }
+  /* As above we need to protect 0xa0 (graph_base) in any case */
   if (config.cpu_vm == CPUVM_KVM || config.cpu_vm_dpmi == CPUVM_KVM)
-    kvm_set_mmio(vmt->base_page * HOST_PAGE_SIZE, vmt->pages * HOST_PAGE_SIZE,
-		 value != 0);
+    kvm_set_mmio(vga.mem.graph_base, vga.mem.graph_size, value != 0);
 }
 
 /*
@@ -2916,10 +2921,7 @@ void vgaemu_adj_cfg(unsigned what, unsigned msg)
 	      ((vga.crtc.data[0x9] & 0x20) << (9 - 5));
       vertical_blanking_end =
 	      vga.crtc.data[0x16] & 0x7F;
-      if (vga.mode_class == TEXT)
-        char_height = (vga.crtc.data[0x9] & 0x1f) + 1;
-      else
-        char_height = vga.char_height;
+      char_height = (vga.crtc.data[0x9] & 0x1f) + 1;
       vertical_multiplier = char_height << ((vga.crtc.data[0x9] & 0x80) >> 7);
       /* see VGADOC: CGA is special for reg 9 */
       if(vga.mode_type == CGA) vertical_multiplier = char_height;
@@ -2940,7 +2942,7 @@ void vgaemu_adj_cfg(unsigned what, unsigned msg)
       if (vga.mode_class == TEXT)
         height *= char_height;
       else
-        height = vga.height;
+        char_height = vga.char_height;
       /* By Eric (eric@coli.uni-sb.de):                        */
       /* Required for 80x100 CGA "text graphics" with 8x2 font */
       if (vga.height != height || vga.char_height != char_height) {
@@ -3059,7 +3061,7 @@ void vgaemu_adj_cfg(unsigned what, unsigned msg)
       }
       old_color_bits = vga.color_bits;
       vga.color_bits = vga.pixel_size;
-      vgaemu_adjust_instremu((vga.mode_type==PL4 || vga.mode_type==PL2)
+      vgaemu_adjust_instremu((vga.mode_type==PL4 || vga.mode_type==PL2 || vga.mem.planes > 1)
 			     ? EMU_ALL_INST : 0);
       if (oldclass != vga.mode_class) {
 	vgaemu_adj_cfg(CFG_SEQ_ADDR_MODE, 0);

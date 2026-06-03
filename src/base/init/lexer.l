@@ -374,6 +374,7 @@ ems_conv_pages		RETURN(EMS_CONV_PAGES);
 
 	/* speaker values */
 
+sound			RETURN(SOUND);
 emulated		RETURN(EMULATED);
 native			RETURN(NATIVE);
 
@@ -588,6 +589,10 @@ vdeswitch		RETURN(VDESWITCH);
 slirpargs		RETURN(SLIRPARGS);
 netsock			RETURN(NETSOCK);
 vnet			RETURN(VNET);
+
+ne2k_iobase		RETURN(NE2K_IOBASE);
+ne2k_irq		RETURN(NE2K_IRQ);
+
 	/* debug flags */
 
 io			RETURN(IO);

@@ -1,6 +1,8 @@
 #include "mangle.h"
 #include "translate/translate.h"
 #include "dos2linux.h"
+#include "utilities.h"
+#include "fslib/fslib.h"
 #include <ctype.h>
 #include <wctype.h>
 #include <errno.h>
@@ -228,4 +230,52 @@ int get_drive_from_path(char *path, int *drive)
 
   *drive = c - 'A';
   return 1;
+}
+
+char *probe_sfn_name(int dfd, const char *dir, const char *name,
+	struct stat *r_st)
+{
+    int rc;
+    char *nbuf, *nm = NULL, *ret;
+
+    assert(dir && dir[0] != '\0');
+    rc = fstatat(dfd, name, r_st, 0);
+    if (rc == 0) {
+        ret = assemble_path(dir, name);
+        goto out;
+    }
+    nm = strdup(name);
+    /* all uppercase */
+    nbuf = strupperDOS(nm);
+    if (strcmp(nbuf, name)) {
+        rc = fstatat(dfd, nbuf, r_st, 0);
+        if (rc == 0) {
+            ret = assemble_path(dir, nbuf);
+            goto out;
+        }
+    }
+    /* all lowercase */
+    nbuf = strlowerDOS(nm);
+    if (strcmp(nbuf, name)) {
+        rc = fstatat(dfd, nbuf, r_st, 0);
+        if (rc == 0) {
+            ret = assemble_path(dir, nbuf);
+            goto out;
+        }
+    }
+    if (nbuf[1] != '\0') {  // if just 1 letter, then already tried uppercase
+        /* first uppercase */
+        nbuf[0] = toupperDOS(nbuf[0]);
+        rc = fstatat(dfd, nbuf, r_st, 0);
+        if (rc == 0) {
+            ret = assemble_path(dir, nbuf);
+            goto out;
+        }
+    }
+    /* nothing */
+    ret = NULL;
+
+out:
+    free(nm);
+    return ret;
 }

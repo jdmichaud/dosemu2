@@ -403,6 +403,9 @@ AX_CHECK_COMPILE_FLAG([-Waddress-of-packed-member],
 AX_CHECK_COMPILE_FLAG([-Wstring-plus-int],
   [DOSEMU_CFLAGS="$DOSEMU_CFLAGS -Wno-string-plus-int"],, [-Werror])
 DOSEMU_LDFLAGS="-pthread"
+if test "x$prefix" != xNONE; then
+  DOSEMU_LDFLAGS="$DOSEMU_LDFLAGS -Wl,-rpath,$libdir"
+fi
 
 AC_CHECK_LIB(m, pow)
 AC_CHECK_DECLS([exp10f],,, [[#include <math.h>]])
@@ -561,6 +564,18 @@ if test "$enable_solib" = "no"; then
   SOLIB=0
 fi
 AC_SUBST(SOLIB)
+
+DIRS_ALLOW=
+AC_ARG_WITH([dj64-lib-dir], AS_HELP_STRING([--with-dj64-lib-dir=DIR],
+        [use alternate dj64dev dir]),
+    [ DIRS_ALLOW="$DIRS_ALLOW $withval" ])
+AC_ARG_WITH([fdpp-lib-dir], AS_HELP_STRING([--with-fdpp-lib-dir=DIR],
+        [use alternate fdpp dir]),
+    [ DIRS_ALLOW="$DIRS_ALLOW $withval" ])
+if test -n "$DIRS_ALLOW"; then
+  AC_DEFINE_UNQUOTED(DIRS_ALLOW,["$DIRS_ALLOW"],
+    [ Directories to allow an access to ])
+fi
 
 if ! test -f Makefile.conf.in; then
   AC_MSG_NOTICE([Populating makefiles...])

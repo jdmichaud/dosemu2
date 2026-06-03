@@ -33,6 +33,7 @@
 #include "timers.h"
 #include "mouse.h"
 #include "disks.h"
+#include "fatfs.h"
 #include "bios.h"
 #include "iodev.h"
 #include "pic.h"
@@ -276,6 +277,8 @@ static void revect_helper(int stk_offs)
 	int i;
 
 	for (i = start; i < 256; i++) {
+	    if (config.force_revect == 1 && i == DOS_HELPER_INT)
+		continue;
 	    if (int_handlers[i].interrupt_function[REVECT])
 		break;
 	}
@@ -673,7 +676,7 @@ static int dos_helper(int stk_offs, int revect)
     case DOS_HELPER_MOUSE_HELPER:{
 	    uint8_t *p = MK_FP32(BIOSSEG, bios_in_int10_callback);
 
-	    switch (LWORD(ebx)) {
+	    switch (LO(bx)) {
 	    case DOS_SUBHELPER_MOUSE_START_VIDEO_MODE_SET:
 		/* Note: we hook int10 very late, after display.sys already hooked it.
 		 * So when we call previous handler in bios.S, we actually call
@@ -694,7 +697,7 @@ static int dos_helper(int stk_offs, int revect)
 		int switched, to_copy;
 		uint64_t cookie;
 		uint8_t *stk, *new_stk;
-		switch (LWORD(ebx)) {
+		switch (LO(bx)) {
 		case DOS_SUBHELPER_MOUSE_START_VIDEO_MODE_SET:
 		    to_copy = _min(64, (0x10000 - _SP) & 0xffff);
 		    switched = get_rm_stack(&new_ss, &new_sp,
@@ -833,6 +836,13 @@ static int dos_helper(int stk_offs, int revect)
 				     SEG_ADR((void *), es, bx));
 	} else {
 	    _AX = -1;
+	}
+	break;
+    case DOS_HELPER_BOOTDISK:
+	switch (LO(bx)) {
+	case DOS_SUBHELPER_DISK_REFRESH:
+	    disk_refresh(HI(bx));
+	    break;
 	}
 	break;
     case DOS_HELPER_BOOTSECT:
@@ -1830,7 +1840,7 @@ RVC_SETUP(x) \
 static far_t int##x##_unrevect(uint16_t seg, uint16_t offs) \
 { \
   far_t ret = {}; \
-  if (int##x##_hooked || (config.force_revect && 0x##x == DOS_HELPER_INT)) \
+  if (int##x##_hooked || (config.force_revect == 1 && 0x##x == DOS_HELPER_INT)) \
     return ret; \
   int##x##_hooked = 1; \
   di_printf("int_rvc: unrevect 0x%s\n", #x); \
@@ -1850,7 +1860,7 @@ static far_t int##x##_unrevect(uint16_t seg, uint16_t offs) \
 static int int##x##_unrevect_simple(void) \
 { \
   if (int##x##_hooked || !int_handlers[0x##x].interrupt_function[REVECT] || \
-        (config.force_revect && 0x##x == DOS_HELPER_INT)) \
+        (config.force_revect == 1 && 0x##x == DOS_HELPER_INT)) \
     return 0; \
   int##x##_hooked = 1; \
   di_printf("int_rvc: unrevect 0x%s\n", #x); \
@@ -2688,9 +2698,25 @@ void com_strfree(char *s)
 uint16_t cancel_redirection(const char *deviceStr)
 {
   char *dStr = com_strdup(deviceStr);
+  int drv_num;
   uint16_t ret;
 
+  drv_num = deviceStr[0] - 'A';
+  if (drv_num < 0 || drv_num > 0x7f) {
+    error("bad device name %s\n", deviceStr);
+    return 0xffff;
+  }
+  if (drv_num >= 2) {
+    drv_num -= 2;
+    drv_num |= 0x80;
+  }
+
   pre_msdos();
+
+  HI(bx) = drv_num;
+  LO(bx) = DOS_SUBHELPER_DISK_REFRESH;
+  LWORD(eax) = DOS_HELPER_BOOTDISK;
+  do_int_call_back(DOS_HELPER_INT);
 
   SREG(ds) = DOSEMU_LMHEAP_SEG;
   LWORD(esi) = DOSEMU_LMHEAP_OFFS_OF(dStr);

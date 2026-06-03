@@ -366,6 +366,7 @@ int emulate(int argc, char **argv, char * const *envp)
      * sockets/spawning threads. */
     dpmi_setup();
     ioselect_init();
+    init_all_DOS_tables();	/* needs to be before iodev_init() for fatfs */
     /* iodev_init() can load plugins, like SDL, that can spawn a thread.
      * This must be done before initializing signals, or problems ensue.
      * This also must be done when the signals are blocked, so after
@@ -375,11 +376,10 @@ int emulate(int argc, char **argv, char * const *envp)
     mhp_init();
 #endif
     priv_drop_total();
-    init_all_DOS_tables();	/* longest init function! needs to be optimized */
     signal_init();              /* initialize sig's & sig handlers */
     if (config.exitearly) {
       dbug_printf("Leaving DOS before booting\n");
-      leavedos(0);
+      leavedos(config_check_only ? 0 : config.exitearly);
     }
     g_printf("EMULATE\n");
 

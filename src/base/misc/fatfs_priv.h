@@ -36,7 +36,6 @@ enum { FAT_TYPE_NONE, FAT_TYPE_FAT12, FAT_TYPE_FAT16, FAT_TYPE_FAT32 };
 
 struct fatfs_s {
   char *dir;				/* base directory name */
-  unsigned ok;				/* successfully initialized */
 
   unsigned secs_track, heads, reserved_secs, hidden_secs, total_secs;
   unsigned bytes_per_sect;
@@ -51,6 +50,8 @@ struct fatfs_s {
   unsigned cluster_secs;
   unsigned char drive_num;
   unsigned int mfs_idx;
+  int group;
+  int dir_fd;
   uint64_t sys_type;			/* see fatfs::scan_dir() */
 
   unsigned got_all_objs;
@@ -60,8 +61,7 @@ struct fatfs_s {
   unsigned sys_objs;
   obj_t *obj;
 
-  char *ffn, *ffn_ptr;			/* buffer for file names */
-  unsigned ffn_obj;
+  char *ffn, *ffn_ptr, *ffn2_ptr;		/* buffer for file names */
 
   unsigned char *boot_sec;
 

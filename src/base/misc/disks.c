@@ -1293,6 +1293,16 @@ static void disk_reset2(void)
      */
     disk_fptrs[dp->type].setup(dp);
   });
+
+  subst_file_ext(NULL);
+  for (dp = disktab; dp < &disktab[FDISKS]; dp++) {
+    if (dp->type == DIR_TYPE)
+      fatfs_init(dp);
+  }
+  FOR_EACH_HDISK(i, {
+    if (hdisktab[i].type == DIR_TYPE)
+      fatfs_init(&hdisktab[i]);
+  });
 }
 
 void disk_reset(void)
@@ -1300,42 +1310,37 @@ void disk_reset(void)
   struct disk *dp;
   int i;
 
-  subst_file_ext(NULL);
   for (dp = disktab; dp < &disktab[FDISKS]; dp++) {
-    if(dp->type == DIR_TYPE) {
-      if (dp->fatfs) fatfs_done(dp);
-      fatfs_init(dp);
-    }
+    if(dp->type == DIR_TYPE)
+      fatfs_reset(dp);
   }
   FOR_EACH_HDISK(i, {
-    if(hdisktab[i].type == DIR_TYPE) {
-      if (hdisktab[i].fatfs) fatfs_done(&hdisktab[i]);
-      fatfs_init(&hdisktab[i]);
-    }
+    if(hdisktab[i].type == DIR_TYPE)
+      fatfs_reset(&hdisktab[i]);
   });
+}
+
+void disk_refresh(unsigned char drv_num)
+{
+  fatfs_t *f = get_fat_fs_by_drive(drv_num);
+
+  if (f)
+      fatfs_refresh(f);
 }
 
 static void hdisk_reset(int num)
 {
   int i;
 
-  subst_file_ext(NULL);
   FOR_EACH_HDISK(i, {
-    if(hdisktab[i].type == DIR_TYPE) {
-      if (hdisktab[i].fatfs)
+    if (HDISK_NUM(i) >= num + 2) {
+      hdisktab[i].drive_num = 0;
+      if (hdisktab[i].type == DIR_TYPE && hdisktab[i].fatfs)
         fatfs_done(&hdisktab[i]);
     }
   });
   if (HDISKS > num)
     HDISKS = num;
-  FOR_EACH_HDISK(i, {
-    if (HDISK_NUM(i) >= num + 2) {
-      hdisktab[i].drive_num = 0;
-      continue;
-    }
-    if(hdisktab[i].type == DIR_TYPE)
-      fatfs_init(&hdisktab[i]);
-  });
 }
 
 int disk_is_bootable(const struct disk *dp)
@@ -1375,7 +1380,7 @@ int disk_validate_boot_part(struct disk *dp)
   if (dp->hdtype == 0) { /* Unspecified disk type */
     d_printf("DISK: Automatically selecting IBM disk type %i\n", hdtype);
     dp->hdtype = hdtype;
-    dp->sectors = -1;
+    disk_fptrs[dp->type].autosense(dp);
   }
 
   /* some old DOSes only boot if there are no more than 2 drives */

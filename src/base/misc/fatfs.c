@@ -84,8 +84,11 @@ static int read_data(fatfs_t *, unsigned, unsigned char *buf);
 static void make_label(fatfs_t *);
 static unsigned new_obj(fatfs_t *);
 static void scan_dir(fatfs_t *, unsigned);
+static void probe_system(fatfs_t *f);
+static void set_vol_and_len(fatfs_t *f, unsigned oi);
 static char *full_name(fatfs_t *, unsigned, const char *);
-static void add_object(fatfs_t *, unsigned, char *);
+static void add_object(fatfs_t *, unsigned, const char *);
+static void add_sys_object(fatfs_t *f, const char *name, struct stat *sb);
 static unsigned dos_time(time_t *);
 static unsigned make_dos_entry(fatfs_t *, const obj_t *, unsigned char **);
 static unsigned find_obj(fatfs_t *, unsigned);
@@ -98,8 +101,6 @@ static int read_dir(fatfs_t *, unsigned, unsigned, unsigned,
 static unsigned next_cluster(fatfs_t *, unsigned);
 static void build_boot_blk(fatfs_t *m, unsigned char *b);
 
-static uint64_t sys_type;
-static int sys_done;
 static const char *real_config_sys = "CONFIG.SYS";
 static char config_sys[16];
 #define MAX_HOOKS 5
@@ -144,7 +145,7 @@ static CONSTEXPR const uint64_t OLDMOS_D = (MOS_D | (1ULL << 32));
 
 FATFS_EXPORTS
 
-static const struct sys_dsc i_sfiles[] = {
+static const struct i_sys_dsc i_sfiles[] = {
     [IO_IDX]   = { "IO.SYS",		1,   },
     [MSD_IDX]  = { "MSDOS.SYS",		1, FLG_ALLOW_EMPTY },
     [DRB_IDX]  = { "DRBIOS.SYS",	1,   },
@@ -175,10 +176,17 @@ static const struct sys_dsc i_sfiles[] = {
     [DEMU_IDX] = { "DOSEMU",		0, FLG_ISDIR },
 };
 
+struct sys_found_s {
+    char *name;
+    int idx;
+};
+static struct sys_found_s sys_found[MAX_SYS_IDX];
+
+static int fs_prio[MAX_SYS_IDX];
+
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void fatfs_init(struct disk *dp)
 {
-  int i;
   fatfs_t *f;
   int num_sectors = dp->tracks * dp->heads * dp->sectors - dp->start;
 
@@ -197,13 +205,17 @@ void fatfs_init(struct disk *dp)
   f = dp->fatfs;
 
   f->ffn = malloc(MAX_DIR_NAME_LEN + MAX_FILE_NAME_LEN + 1);
-  if(!f->ffn) {
-    fatfs_msg("init failed: no memory left\n");
-    return;
-  }
-  f->ffn_obj = 1;			/* this object doesn't exist */
+  assert(f->ffn);
+
+  f->boot_sec = malloc(0x200);
 
   f->dir = dp->dev_name;
+  f->dir_fd = open(f->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (f->dir_fd == -1) {
+    error("fatfs: failed to open %s: %s\n", f->dir, strerror(errno));
+    leavedos_main(5);
+    return;
+  }
   if (dp->floppy) {
     switch (dp->default_cmos) {
       case THREE_INCH_2880KFLOP:
@@ -278,15 +290,17 @@ void fatfs_init(struct disk *dp)
                     - f->root_secs) / f->cluster_secs + 1;
   f->drive_num = dp->drive_num;
   f->mfs_idx = dp->mfs_idx;
+  f->group = dp->group;
 
   f->obj = NULL;
   f->objs = f->alloc_objs = 0;
 
   new_obj(f);			/* going to be our root dir object */
-  if(f->obj == NULL) {
-    fatfs_msg("init failed: no memory left\n");
-    return;
-  }
+  assert(f->obj);
+  /* entry 0 not freed, not doing strdup() here */
+  f->obj[0].name = f->dir;
+  f->obj[0].full_name = f->dir;
+  f->obj[0].is.dir = 1;
 
   f->got_all_objs = 0;
   f->first_free_cluster = 2;
@@ -294,7 +308,6 @@ void fatfs_init(struct disk *dp)
   make_label(f);
 
   fatfs_deb2("init: volume label set to \"%s\"\n", f->label);
-  memcpy(f->sfiles, i_sfiles, sizeof(f->sfiles));
   strcpy(config_sys, real_config_sys);
   if (config.emusys) {
     char *p = strrchr(config_sys, '.');
@@ -302,16 +315,57 @@ void fatfs_init(struct disk *dp)
       strlcpy(p + 1, config.emusys, 4);
     strupperDOS(config_sys);
   }
-  for (i = 0; i < sys_hooks_used; i++)
-    sys_hook[i](f->sfiles, f);
-  f->ok = 1;
-  /* entry 0 not freed, not doing strdup() here */
-  f->obj[0].name = f->dir;
-  f->obj[0].full_name = f->dir;
-  f->obj[0].is.dir = 1;
-  scan_dir(f, 0);	/* set # of root entries accordingly ??? */
 }
 
+void fatfs_reset(struct disk *dp)
+{
+  int i;
+  fatfs_t *f = dp->fatfs;
+
+  assert(f->objs >= 1);
+  for(i = 1; i < f->objs; i++) {
+    if(f->obj[i].name)
+      free(f->obj[i].name);
+    if(f->obj[i].full_name)
+      free(f->obj[i].full_name);
+  }
+  f->objs = 1;
+  f->obj[0].is.scanned = 0;
+  f->got_all_objs = 0;
+  f->first_free_cluster = 2;
+  f->drive_num = dp->drive_num;  // for swap_bootdrive
+
+  for (i = 0; i < MAX_SYS_IDX; i++) {
+    strcpy(f->sfiles[i].name, i_sfiles[i].name);
+    f->sfiles[i].is_sys = i_sfiles[i].is_sys;
+    f->sfiles[i].flags = i_sfiles[i].flags;
+  }
+  for (i = 0; i < sys_hooks_used; i++)
+    sys_hook[i](f->sfiles, f);
+
+  probe_system(f);
+#ifdef USE_FDPP
+    /* very heuristical fdpp check */
+#define FDPP_BOOT(f) \
+    ((f)->sys_type == 0 && (f)->group == 0 && config.hdiskboot == -1 && \
+     config.swap_bootdrv == 0)
+#else
+#define FDPP_BOOT(f) 0
+#endif
+  if (!FDPP_BOOT(f))
+    scan_dir(f, 0);
+  else
+    set_vol_and_len(f, 0);
+
+  if (f->sys_objs)
+    assign_clusters(f, 0, f->sys_objs);
+}
+
+void fatfs_refresh(fatfs_t *f)
+{
+  if (!f->obj[0].is.scanned)
+    scan_dir(f, 0);
+}
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void fatfs_done(struct disk *dp)
@@ -323,7 +377,9 @@ void fatfs_done(struct disk *dp)
 
   if(!(f = dp->fatfs)) return;
 
-  for(u = 1 ; u < f->objs; u++) {
+  close(f->dir_fd);
+
+  for(u = 1; u < f->objs; u++) {
     if(f->obj[u].name)
       free(f->obj[u].name);
     if(f->obj[u].full_name)
@@ -348,8 +404,6 @@ int fatfs_read(fatfs_t *f, unsigned buf, unsigned pos, int len)
 
   fatfs_deb("read: dir %s, sec %u, len %d\n", f->dir, pos, l);
 
-  if(!f->ok) return -1;
-
   while(l) {
     if((i = read_sec(f, pos, b))) return i;
     MEMCPY_2DOS(buf, b, 0x200);
@@ -367,9 +421,6 @@ int fatfs_read(fatfs_t *f, unsigned buf, unsigned pos, int len)
 int fatfs_write(fatfs_t *f, unsigned buf, unsigned pos, int len)
 {
   error("fatfs write ignored: dir %s, sec %u, len %d\n", f->dir, pos, len);
-
-  if(!f->ok) return -1;
-
   return len;
 }
 
@@ -710,17 +761,23 @@ static const char *system_type(uint64_t t) {
     return "Unknown System Type";
 }
 
-static int fs_prio[MAX_SYS_IDX];
-
-static fatfs_t *cur_d;
-
-static int get_s_idx(const char *name, fatfs_t *f)
+static int get_s_idx(const char *name, const fatfs_t *f)
 {
     int i;
     for (i = 0; i < MAX_SYS_IDX; i++) {
-	if (!f->sfiles[i].name)
+	if (f->sfiles[i].name[0] == '\0')
 	    continue;
-	if (strequalDOS(name, f->sfiles[i].name))
+	if (strcmp(name, f->sfiles[i].name) == 0)
+	    return i;
+    }
+    return -1;
+}
+
+static int get_s_idx_glb(const char *name)
+{
+    int i;
+    for (i = 0; i < MAX_SYS_IDX; i++) {
+	if (strequalDOS(name, i_sfiles[i].name))
 	    return i;
     }
     return -1;
@@ -761,119 +818,140 @@ static int d_filter(const struct dirent *d)
 
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 	return 0;
-    idx = sys_file_idx(name, cur_d);
+    idx = get_s_idx_glb(name);
     if (idx != -1)
-	sys_type |= 1 << idx;
-    idx = get_s_idx(name, cur_d);
-    if (idx != -1)
-	cur_d->sys_found[idx] = 1;
+	return 0;
     return 1;
 }
 
-static void init_sfiles(void)
+static int probe_sfiles(fatfs_t *f)
+{
+    int cnt = 0;
+
+    for (int idx = 0; idx < MAX_SYS_IDX; idx++) {
+	char *p, *fname;
+	struct sys_dsc *s = &f->sfiles[idx];
+
+	if (s->name[0] == '\0')
+	    continue;
+	fname = probe_sfn_name(f->dir_fd, f->dir, s->name, &s->sb);
+	if (!fname)
+	    continue;
+	if (s->is_sys)
+	    f->sys_type |= 1 << idx;
+	f->sys_found[idx] = 1;
+	p = strrchr(fname, '/');
+	assert(p);
+	strcpy(f->sfiles[idx].name, p + 1);
+	sys_found[cnt].name = fname;
+	sys_found[cnt].idx = idx;
+	cnt++;
+    }
+    return cnt;
+}
+
+static int s_compar(const void *ent1, const void *ent2)
+{
+    const struct sys_found_s *sf1 = ent1;
+    const struct sys_found_s *sf2 = ent2;
+    const char *name1 = sf1->name;
+    const char *name2 = sf2->name;
+    int idx1 = sf1->idx;
+    int idx2 = sf2->idx;
+    int prio1, prio2;
+    assert(idx1 != -1 && idx2 != -1);
+    prio1 = fs_prio[idx1];
+    prio2 = fs_prio[idx2];
+    if (prio1 && (!prio2 || prio1 < prio2))
+       return -1;
+    if (prio2 && (!prio1 || prio2 < prio1))
+       return 1;
+    return strcmp(name1, name2);
+}
+
+static void init_sfiles(fatfs_t *f)
 {
     int i, sfs = 1;
     int sysf_located = 0;
+    int s_found = probe_sfiles(f);
+
     memset(fs_prio, 0, sizeof(fs_prio));
-    if((sys_type & MS_D) == MS_D) {
-      sys_type = MS_D;		/* MS-DOS */
+    if((f->sys_type & MS_D) == MS_D) {
+      f->sys_type = MS_D;		/* MS-DOS */
       fs_prio[IO_IDX] = sfs++;
       fs_prio[MSD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & DR_D) == DR_D) {
-      sys_type = DR_D;		/* DR-DOS */
+    if((f->sys_type & DR_D) == DR_D) {
+      f->sys_type = DR_D;		/* DR-DOS */
       fs_prio[DRB_IDX] = sfs++;
       fs_prio[DRD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & EDR_D) == EDR_D) {
-      sys_type = EDR_D;		/* Enhanced DR-DOS (7.01.07+) */
+    if((f->sys_type & EDR_D) == EDR_D) {
+      f->sys_type = EDR_D;		/* Enhanced DR-DOS (7.01.07+) */
       fs_prio[EDRB_IDX] = sfs++;
       fs_prio[EDRD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & PC_D) == PC_D) {
-      sys_type = PC_D;		/* PC-DOS */
+    if((f->sys_type & PC_D) == PC_D) {
+      f->sys_type = PC_D;		/* PC-DOS */
       fs_prio[IBMB_IDX] = sfs++;
       fs_prio[IBMD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & RXO_D) == RXO_D) {
-      sys_type = RXO_D;		/* RxDOS (Old naming) */
+    if((f->sys_type & RXO_D) == RXO_D) {
+      f->sys_type = RXO_D;		/* RxDOS (Old naming) */
       fs_prio[RXOB_IDX] = sfs++;
       fs_prio[RXOD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & RXM_D) == RXM_D) {
-      sys_type = RXM_D;		/* RxDOS (New naming) */
+    if((f->sys_type & RXM_D) == RXM_D) {
+      f->sys_type = RXM_D;		/* RxDOS (New naming) */
       fs_prio[RXMB_IDX] = sfs++;
       fs_prio[RXMD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & RXN_D) == RXN_D) {
-      sys_type = RXN_D;		/* RxDOS 7.23+, single-file loading */
+    if((f->sys_type & RXN_D) == RXN_D) {
+      f->sys_type = RXN_D;		/* RxDOS 7.23+, single-file loading */
       fs_prio[RXND_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & MOS_D) == MOS_D) {
-      sys_type = MOS_D;		/* PC-MOS/386 */
+    if((f->sys_type & MOS_D) == MOS_D) {
+      f->sys_type = MOS_D;		/* PC-MOS/386 */
       fs_prio[MOSB_IDX] = sfs++;
       fs_prio[MOSD_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & FDO_D) == FDO_D) {
-      sys_type = FDO_D;		/* FreeDOS, orig. Patv kernel */
+    if((f->sys_type & FDO_D) == FDO_D) {
+      f->sys_type = FDO_D;		/* FreeDOS, orig. Patv kernel */
       fs_prio[IPL_IDX] = sfs++;
       sysf_located = 1;
     }
-    if((sys_type & FD_D) == FD_D) {
-      sys_type = FD_D;		/* FreeDOS, FD maintained kernel */
+    if((f->sys_type & FD_D) == FD_D) {
+      f->sys_type = FD_D;		/* FreeDOS, FD maintained kernel */
       fs_prio[KER_IDX] = sfs++;
       sysf_located = 1;
     }
 #ifdef USE_FDPP
-    if((sys_type & FDP_D) == FDP_D) {
-      sys_type = FDP_D;		/* FDPP kernel */
+    if((f->sys_type & FDP_D) == FDP_D) {
+      f->sys_type = FDP_D;		/* FDPP kernel */
       fs_prio[FDP_IDX] = sfs++;
       sysf_located = 1;
     }
 #endif
     for (i = 0; i < MAX_SYS_IDX; i++) {
-	if (!cur_d->sfiles[i].name)
+	if (f->sfiles[i].name[0] == '\0')
 	    continue;
-	if (cur_d->sfiles[i].is_sys || !cur_d->sys_found[i])
+	if (f->sfiles[i].is_sys || !f->sys_found[i])
 	    continue;
 	fs_prio[i] = sfs++;
     }
-    cur_d->sys_objs = sfs - 1;
+    f->sys_objs = sfs - 1;
     if (!sysf_located)
-	sys_type = 0;
-    sys_done = 1;
-}
-
-static int d_compar(const struct dirent **d1, const struct dirent **d2)
-{
-    const char *name1 = (*d1)->d_name;
-    const char *name2 = (*d2)->d_name;
-    int idx1 = get_s_idx(name1, cur_d);
-    int idx2 = get_s_idx(name2, cur_d);
-    int prio1, prio2;
-    if (idx1 == -1 && idx2 == -1)
-	return alphasort(d1, d2);
-    if (idx1 == -1)
-	return 1;
-    if (idx2 == -1)
-	return -1;
-    if (!sys_done)
-	init_sfiles();
-    prio1 = fs_prio[idx1];
-    prio2 = fs_prio[idx2];
-    if (prio1 && (!prio2 || prio1 < prio2))
-	return -1;
-    if (prio2 && (!prio1 || prio2 < prio1))
-	return 1;
-    return alphasort(d1, d2);
+	f->sys_type = 0;
+    else
+	qsort(sys_found, s_found, sizeof(sys_found[0]), s_compar);
 }
 
 static void set_vol_and_len(fatfs_t *f, unsigned oi)
@@ -892,7 +970,7 @@ static void set_vol_and_len(fatfs_t *f, unsigned oi)
         if(!f->obj[oi].first_child) f->obj[oi].first_child = u;
         f->obj[u].dos_dir_size = 0x20;
         o->size += 0x20;
-        if(!mfs_stat_file(f->mfs_idx, f->dir, &sb)) {
+        if(!fstat(f->dir_fd, &sb)) {
           f->obj[u].time = dos_time(&sb.st_mtime);
         }
 	fatfs_deb2("added label \"%s\"\n", f->label);
@@ -904,78 +982,22 @@ static void set_vol_and_len(fatfs_t *f, unsigned oi)
   o->len = (o->size + u - 1) / u;
 }
 
-/*
- * Reads the directory entries and assigns the object ids.
- */
-void scan_dir(fatfs_t *f, unsigned oi)
+static void probe_system(fatfs_t *f)
 {
-  obj_t *o = f->obj + oi;
-  char *s, *name;
-  unsigned u;
-  int i;
-  struct dirent **dlist;
-  int num;
-  int read_bb;
-  int dfd;
-
-  // just checking...
-  if(!o->is.dir || o->size || !o->name || o->is.scanned) {
-    fatfs_msg("scan_dir: oops #1\n");
-    return;
-  }
-
-  fatfs_deb2("scan_dir: reading \"%s\"\n", o->name);
-
-  o->is.scanned = 1;
-
-  name = full_name(f, oi, "");
-  if(!name) {
-    fatfs_msg("file name too complex: object %u\n", oi);
-    return;
-  }
-  if (!oi) {
-    sys_type = sys_done = 0;
-    memset(f->sys_found, 0, sizeof(f->sys_found));
-    f->sys_objs = 0;
-  }
-  dfd = mfs_open_file(f->mfs_idx, name, O_RDONLY | O_DIRECTORY);
-  if (dfd == -1) {
-    fatfs_msg("%s open failed\n", name);
-    return;
-  }
-  cur_d = f;
-  num = fdscandir(dfd, &dlist, d_filter, d_compar);
-  close(dfd);
-  if (num < 0) {
-    fatfs_msg("fatfs: scandir failed for %s\n", name);
-    return;
-  }
-  if (!sys_done)
-    init_sfiles();
-
-  if(oi) {
-    for(i = 0; i < 2; i++) {
-      if((u = new_obj(f))) {	/* ".", ".." */
-        o = f->obj + oi;
-        f->obj[u].is.dir = 1;
-        if(i)
-          f->obj[u].is.parent_dir = 1;
-        else
-          f->obj[u].is.this_dir = 1;
-        f->obj[u].is.not_real = 1;
-        f->obj[u].parent = oi;
-        f->obj[u].dos_dir_size = 0x20;
-        if(!f->obj[oi].first_child) f->obj[oi].first_child = u;
-        o->size += 0x20;
-      }
-    }
-  } else {
-    char *buf, *buf_ptr;
-    int fd, size;
+    char *buf, *buf_ptr, *s;
+    int fd, size, i;
+    int read_bb;
     struct stat sb;
 
-    if (sys_type == MS_D) {
-        s = full_name(f, oi, dlist[0]->d_name); /* io.sys */
+    f->sys_type = 0;
+    memset(f->sys_found, 0, sizeof(f->sys_found));
+    f->sys_objs = 0;
+    init_sfiles(f);
+    if (!f->sys_type) {
+      fatfs_msg("system files not found!\n");
+    } else {
+      if (f->sys_type == MS_D) {
+        s = sys_found[0].name; /* io.sys */
         if (s && (fd = mfs_open_file(f->mfs_idx, s, O_RDONLY)) != -1) {
             int err = fstat(fd, &sb);
             assert(!err);
@@ -984,21 +1006,21 @@ void scan_dir(fatfs_t *f, unsigned oi)
             size = read(fd, buf, sb.st_size);
             if (size > 0) {
                 if(buf[0] == 'M' && buf[1] == 'Z') {  /* MS-DOS >= 7 */
-                    sys_type = NEWMSD_D;
+                    f->sys_type = NEWMSD_D;
                 } else {           /* see if it has a version string */
                     buf[size] = '\0';
                     for (buf_ptr=buf;buf_ptr < buf + size; buf_ptr++) {
                         if(strncmp(buf_ptr, "NEC IO.SYS for MS-DOS", 21)==0) {
-                            sys_type = NECMSD_D;
+                            f->sys_type = NECMSD_D;
                             break;
                         }
                         if(strncmp(buf_ptr, "Version ", 8) == 0) {
                             char *vno = buf_ptr+8;
                             if(*vno >= '1' && *vno <= '3') {
-                                sys_type = OLDMSD_D;
+                                f->sys_type = OLDMSD_D;
                                 break;
                             } else if(*vno >= '4'&& *vno <= '6') {
-                                sys_type = MIDMSD_D;
+                                f->sys_type = MIDMSD_D;
                                 break;
                             } else {
                                 char sc[21];
@@ -1012,17 +1034,17 @@ void scan_dir(fatfs_t *f, unsigned oi)
             }
             free(buf);
             close(fd);
-            if ((sys_type == MS_D) && (sb.st_size <= 26*1024)) {
-                sys_type = OLDMSD_D; /* unknown but small enough to be < v4 */
+            if ((f->sys_type == MS_D) && (sb.st_size <= 26*1024)) {
+                f->sys_type = OLDMSD_D; /* unknown but small enough to be < v4 */
             }
         }
-        if (sys_type == MS_D)
-            sys_type = MIDMSD_D;     /* default to v4.x -> v6.x */
-    }
+        if (f->sys_type == MS_D)
+            f->sys_type = MIDMSD_D;     /* default to v4.x -> v6.x */
+      }
 
-    if (sys_type == PC_D) {
+      if (f->sys_type == PC_D) {
         /* see if it is PC-DOS or Original DR-DOS */
-        s = full_name(f, oi, dlist[0]->d_name);
+        s = sys_found[0].name;
         if (s && (fd = mfs_open_file(f->mfs_idx, s, O_RDONLY)) != -1) {
             int err = fstat(fd, &sb);
             assert(!err);
@@ -1043,25 +1065,25 @@ void scan_dir(fatfs_t *f, unsigned oi)
                 }
                 if (buf_ptr < buf + size) {
                     if (strstr(buf_ptr, "IBM DOS"))
-                        sys_type = NEWPCD_D;
+                        f->sys_type = NEWPCD_D;
                     else if (strstr(buf_ptr, "DR-DOS") ||
                              strstr(buf_ptr, "DR-OpenDOS") ||
                              strstr(buf_ptr, "Caldera") ||
                              strstr(buf_ptr, "Novell") ||
                              strstr(buf_ptr, "DIGITAL RESEARCH"))
-                        sys_type = MIDDRD_D;
+                        f->sys_type = MIDDRD_D;
                     else
-                        sys_type = OLDPCD_D;
+                        f->sys_type = OLDPCD_D;
                 }
             }
             free(buf);
             close(fd);
-            if ((sys_type == PC_D) && (sb.st_size <= 26*1024)) {
-                sys_type = OLDPCD_D; /* unknown but small enough to be < v4 */
+            if ((f->sys_type == PC_D) && (sb.st_size <= 26*1024)) {
+                f->sys_type = OLDPCD_D; /* unknown but small enough to be < v4 */
             }
         }
         /* see if it is MS-DOS 4.0 */
-        s = full_name(f, oi, dlist[1]->d_name);
+        s = sys_found[1].name;
         if (s && (fd = mfs_open_file(f->mfs_idx, s, O_RDONLY)) != -1) {
             int err = fstat(fd, &sb);
             assert(!err);
@@ -1076,43 +1098,39 @@ void scan_dir(fatfs_t *f, unsigned oi)
                     buf_ptr += strlen(buf_ptr) + 1;
                 }
                 if (buf_ptr < buf + size)
-                    sys_type = OLDMSD_D;  // Multitasking DOS 4.0
+                    f->sys_type = OLDMSD_D;  // Multitasking DOS 4.0
             }
             free(buf);
             close(fd);
         }
-        if (sys_type == PC_D)
-            sys_type = NEWPCD_D;     /* default to v4.x -> v7.x */
-    }
+        if (f->sys_type == PC_D)
+            f->sys_type = NEWPCD_D;     /* default to v4.x -> v7.x */
+      }
 
-    if (sys_type == MOS_D) {
-      /* see if it is old MOS */
-      s = full_name(f, oi, dlist[0]->d_name);
-      if (s && ((fd = mfs_open_file(f->mfs_idx, s, O_RDONLY)) != -1)) {
+      if (f->sys_type == MOS_D) {
+        /* see if it is old MOS */
+        s = sys_found[0].name;
+        if (s && ((fd = mfs_open_file(f->mfs_idx, s, O_RDONLY)) != -1)) {
           uint32_t buf;
           int err = fstat(fd, &sb);
+          int rc;
           assert(!err);
           if (sb.st_size == 128880) {
               lseek(fd, 0x175, SEEK_SET);
-              read(fd, &buf, sizeof(buf));
-              if (buf == 0x20200105)    /* 5.01 */
-                  sys_type = OLDMOS_D;
+              rc = read(fd, &buf, sizeof(buf));
+              if (rc == sizeof(buf) && buf == 0x20200105)    /* 5.01 */
+                  f->sys_type = OLDMOS_D;
           }
           close(fd);
+        }
       }
-    }
 
-    if (!sys_type) {
-      fatfs_msg("system files not found!\n");
-    } else {
-      f->sys_type = sys_type;
       fatfs_msg("system type is \"%s\" (0x%"PRIx64")\n",
                 system_type(f->sys_type), f->sys_type);
     }
 
     /* load boot block from "boot.blk" file or generate Dosemu's own */
-    f->boot_sec = malloc(0x200);
-    s = full_name(f, oi, "boot.blk");
+    s = full_name(f, 0, "boot.blk");
     read_bb = 0;
     if (s && (fd = mfs_open_file(f->mfs_idx, s, O_RDONLY)) != -1) {
       if (
@@ -1128,6 +1146,73 @@ void scan_dir(fatfs_t *f, unsigned oi)
       fatfs_msg("fatfs: boot block generated\n");
       build_boot_blk(f, f->boot_sec);
     }
+
+    for (i = 0; i < MAX_SYS_IDX; i++) {
+      int idx = sys_found[i].idx;
+      if (!sys_found[i].name)
+        break;
+      add_sys_object(f, f->sfiles[idx].name, &f->sfiles[idx].sb);
+      free(sys_found[i].name);
+      sys_found[i].name = NULL;
+    }
+}
+
+/*
+ * Reads the directory entries and assigns the object ids.
+ */
+static void scan_dir(fatfs_t *f, unsigned oi)
+{
+  obj_t *o = f->obj + oi;
+  char *name;
+  unsigned u;
+  int i;
+  struct dirent **dlist;
+  int num;
+  int dfd;
+
+  // just checking...
+  if(!o->is.dir || !o->name || o->is.scanned) {
+    error("scan_dir: oops #1\n");
+    return;
+  }
+
+  fatfs_deb2("scan_dir: reading \"%s\"\n", o->name);
+
+  o->is.scanned = 1;
+
+  name = full_name(f, oi, "");
+  if(!name) {
+    fatfs_msg("file name too complex: object %u\n", oi);
+    return;
+  }
+  dfd = mfs_open_file(f->mfs_idx, name, O_RDONLY | O_DIRECTORY);
+  if (dfd == -1) {
+    fatfs_msg("%s open failed\n", name);
+    return;
+  }
+  num = fdscandir(dfd, &dlist, d_filter, alphasort);
+  close(dfd);
+  if (num < 0) {
+    fatfs_msg("fatfs: scandir failed for %s\n", name);
+    return;
+  }
+
+  if(oi) {
+    for(i = 0; i < 2; i++) {
+      if((u = new_obj(f))) {	/* ".", ".." */
+        o = f->obj + oi;
+        f->obj[u].is.dir = 1;
+        if(i)
+          f->obj[u].is.parent_dir = 1;
+        else
+          f->obj[u].is.this_dir = 1;
+        f->obj[u].is.not_real = 1;
+        f->obj[u].parent = oi;
+        f->obj[u].dos_dir_size = 0x20;
+        if(!f->obj[oi].first_child) f->obj[oi].first_child = u;
+        o->size += 0x20;
+      }
+    }
   }
 
   for (i = 0; i < num; i++) {
@@ -1138,8 +1223,6 @@ void scan_dir(fatfs_t *f, unsigned oi)
   free(dlist);
 
   set_vol_and_len(f, oi);
-  if (!oi && f->sys_objs)
-    assign_clusters(f, 0, f->sys_objs);
 }
 
 int fatfs_get_part_type(const fatfs_t *f)
@@ -1158,11 +1241,10 @@ int fatfs_get_part_type(const fatfs_t *f)
 /*
  * Return fully qualified filename.
  */
-char *full_name(fatfs_t *f, unsigned oi, const char *name)
+static char *do_full_name(fatfs_t *f, unsigned oi, const char *name, int par)
 {
   char *s = f->ffn;
   int i = MAX_DIR_NAME_LEN, j;
-  unsigned save_oi;
 
   if(!s || !name || oi >= f->objs) return NULL;
 
@@ -1175,52 +1257,44 @@ char *full_name(fatfs_t *f, unsigned oi, const char *name)
 #else
   strcpy(s + i, name);
 #endif
-  /* directory name cached ? */
-  if(oi == f->ffn_obj) {
-    fatfs_deb2("full_name: %u = \"%s\" (cached)\n", oi, f->ffn_ptr);
-    return f->ffn_ptr;
-  }
 
-  save_oi = oi;
-  f->ffn_obj = 1;
   f->ffn_ptr = NULL;
+  f->ffn2_ptr = NULL;
 
   do {
     if(!(name = f->obj[oi].name)) return NULL;
     j = strlen(name);
     if(j + 1 > i) return NULL;
+    if (oi == par) f->ffn2_ptr = s + i;
     s[--i] = '/';
     memcpy(s + (i -= j), name, j);
-    if(!oi) break;
+    if (!oi) break;
     oi = f->obj[oi].parent;
   } while(1);
 
-  fatfs_deb2("full_name: %d = \"%s\"\n", save_oi, s + i);
+  fatfs_deb2("full_name: \"%s\"\n", s + i);
 
-  f->ffn_obj = save_oi;
   return f->ffn_ptr = s + i;
 }
 
-
-static void _add_object(fatfs_t *f, unsigned parent, char *s, const char *name)
+static char *full_name(fatfs_t *f, unsigned oi, const char *name)
 {
-  struct stat sb;
+  return do_full_name(f, oi, name, -1);
+}
+
+static void __add_object(fatfs_t *f, unsigned parent, const char *s,
+    const char *name, struct stat *sb)
+{
   obj_t tmp_o = {{0}, 0};
   unsigned u;
 
-  fatfs_deb("trying to add \"%s\":\n", s);
-  if(mfs_stat_file(f->mfs_idx, s, &sb)) {
-      fatfs_deb("file not found\n");
-      return;
-  }
-
-  if(!(S_ISDIR(sb.st_mode) || S_ISREG(sb.st_mode))) {
+  if(!(S_ISDIR(sb->st_mode) || S_ISREG(sb->st_mode))) {
     fatfs_deb("entry ignored\n");
     return;
   }
 
-  if(S_ISREG(sb.st_mode)) {
-    tmp_o.size = sb.st_size;
+  if(S_ISREG(sb->st_mode)) {
+    tmp_o.size = sb->st_size;
     u = f->cluster_secs << 9;
     tmp_o.len = (tmp_o.size + u - 1) / u;
     if(tmp_o.size == 0) tmp_o.is.not_real = 1;
@@ -1229,10 +1303,10 @@ static void _add_object(fatfs_t *f, unsigned parent, char *s, const char *name)
     tmp_o.is.dir = 1;
   }
 
-  if(!(sb.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) tmp_o.is.ro = 1;
+  if(!(sb->st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) tmp_o.is.ro = 1;
   tmp_o.parent = parent;
 
-  tmp_o.time = dos_time(&sb.st_mtime);
+  tmp_o.time = dos_time(&sb->st_mtime);
 
   tmp_o.full_name = strdup(s);
   tmp_o.name = strdup(name);
@@ -1271,20 +1345,43 @@ err:
   free(tmp_o.full_name);
 }
 
-void add_object(fatfs_t *f, unsigned parent, char *nm)
+static void _add_object(fatfs_t *f, unsigned parent, const char *s,
+	const char *name, const char *relname)
 {
-  char *s, *name = nm;
+  struct stat sb;
+
+  fatfs_deb("trying to add \"%s\":\n", s);
+  if(fstatat(f->dir_fd, relname, &sb, 0)) {
+      fatfs_deb("file not found\n");
+      return;
+  }
+  return __add_object(f, parent, s, name, &sb);
+}
+
+static void add_object(fatfs_t *f, unsigned parent, const char *name)
+{
+  const char *s;
 
   if(!(strcmp(name, ".") && strcmp(name, ".."))) return;
 
-  if (nm[0] == '/') {
-    s = nm;
-    name = strrchr(nm, '/') + 1;
-  } else {
-    if(!(s = full_name(f, parent, name))) {
+  assert(name[0] != '/');
+  if (!(s = do_full_name(f, parent, name, 0))) {
       fatfs_msg("file name too complex: parent %u, name \"%s\"\n", parent, name);
       return;
-    }
+  }
+
+  return _add_object(f, parent, s, name, f->ffn2_ptr);
+}
+
+static void add_sys_object(fatfs_t *f, const char *name, struct stat *sb)
+{
+  const char *s;
+  int parent = 0;
+
+  assert(name[0] != '/');
+  if (!(s = full_name(f, parent, name))) {
+      fatfs_msg("file name too complex: parent %u, name \"%s\"\n", parent, name);
+      return;
   }
   if (strcasecmp(name, real_config_sys) == 0 &&
       strcasecmp(name, config_sys) != 0) {
@@ -1293,11 +1390,11 @@ void add_object(fatfs_t *f, unsigned parent, char *nm)
   }
   if (strcasecmp(name, config_sys) == 0 &&
       strcasecmp(name, real_config_sys) != 0) {
-    _add_object(f, parent, s, real_config_sys);
+    _add_object(f, parent, s, real_config_sys, real_config_sys);
     fatfs_deb("fatfs: subst %s -> %s\n", name, real_config_sys);
   }
 
-  return _add_object(f, parent, s, name);
+  return __add_object(f, parent, s, name, sb);
 }
 
 unsigned dos_time(time_t *tt)
@@ -1644,7 +1741,7 @@ void mimic_boot_blk(void)
   fatfs_t *f = get_fat_fs_by_drive(LO(dx));
 
   if (!f || (idx = sys_file_idx(f->obj[1].name, f)) == -1) {
-    error("BOOT-helper requested, but no systemfile available\n");
+    error("BOOT-helper requested, but no %s available\n", f->obj[1].name);
     leavedos(99);
     return;
   }
