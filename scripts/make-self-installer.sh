@@ -184,8 +184,18 @@ cp -a "$PLUGINDIR/."                   "$STAGE/lib/dosemu/"
 cp -a "$LIBDOSEMU"                     "$STAGE/lib/"
 # recreate the unversioned libdosemu2.so symlink (relative)
 ( cd "$STAGE/lib" && ln -sf "$(basename "$LIBDOSEMU")" libdosemu2.so )
-cp -a "$FDPP_LIB_DIR/."                "$STAGE/lib/fdpp/"     # normalize -> lib/fdpp
-cp -a "$FDPP_SHARE_DIR/."              "$STAGE/share/fdpp/"
+# Copy ONLY the fdpp libraries (+ version symlinks), never the whole parent
+# dir: libfdpp may be installed straight into a shared/multiarch libdir, and
+# copying that would slurp the entire system lib tree (gigabytes).
+fdpp_n=0
+for f in "$FDPP_LIB_DIR"/libfdpp.so* "$FDPP_LIB_DIR"/libfdldr.so*; do
+  [ -e "$f" ] && { cp -a "$f" "$STAGE/lib/fdpp/"; fdpp_n=1; }
+done
+[ "$fdpp_n" = 1 ] || die "no libfdpp/libfdldr found in $FDPP_LIB_DIR"
+# Likewise copy only the fdpp kernel files (ELF required; .map is harmless).
+for f in "$FDPP_SHARE_DIR"/fdppkrnl*; do
+  [ -e "$f" ] && cp -a "$f" "$STAGE/share/fdpp/"
+done
 cp -a "$PREFIX/share/dosemu/."         "$STAGE/share/dosemu/"
 cp -a "$COMCOM_DIR/."                  "$STAGE/share/$CC_NAME/"
 [ -e "$PREFIX/bin/mkfatimage16" ] && cp -a "$PREFIX/bin/mkfatimage16" "$STAGE/bin/" || true
@@ -281,6 +291,15 @@ if grep -Eq "(^|[^A-Za-z0-9_])$PREFIX(/|\"|$)" "$STAGE/bin/dosemu"; then
   echo "ERROR: relocatable launcher still references $PREFIX:" >&2
   grep -n "$PREFIX" "$STAGE/bin/dosemu" >&2 || true
   exit 1
+fi
+
+# sanity: the runtime is ~40 MB (more with debug symbols). A staged tree in the
+# gigabytes means some path (fdpp/plugin/comcom) resolved too broadly and pulled
+# in unrelated files -- fail loudly rather than ship a bloated installer.
+STAGE_KB="$(du -sk "$STAGE" | awk '{print $1}')"
+log "Staged tree: $((STAGE_KB / 1024)) MB"
+if [ "${STAGE_KB:-0}" -gt 1048576 ]; then
+  die "staged tree is $((STAGE_KB / 1024)) MB (> 1 GB) -- a path resolved too broadly; refusing to build a bloated installer"
 fi
 
 # --- pack the payload -------------------------------------------------------
